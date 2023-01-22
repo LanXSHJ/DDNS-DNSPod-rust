@@ -1,0 +1,22 @@
+[package]
+name = "ddns-dnspod-rust"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+hmac = "0.12.1"
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+http = "0.2.8"
+serde = { version = "1.0.137", features = ["derive"] }
+serde_json = { version = "1.0.81", features = ["preserve_order"] }
+anyhow = "1.0.68"
+serde_yaml = "0.9.17"
+lazy_static = "1.4.0"
+clap = { version = "4.1.1", features = ["derive"] }
+sha256 = "1.1.1"
+chrono = "0.4.23"
+sha2 = "0.10.6"
+hex = "0.4.3"

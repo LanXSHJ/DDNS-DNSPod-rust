@@ -1,0 +1,8 @@
+DNSPod:
+  SecretId: SecretId
+  SecretKey: SecretKey
+Domain:
+  Domain: domain.com
+  SubDomain: subdomain
+  RecordType: A
+  RecordLine: 默认
