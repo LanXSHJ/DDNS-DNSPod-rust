@@ -4,5 +4,4 @@ DNSPod:
 Domain:
   Domain: domain.com
   SubDomain: subdomain
-  RecordType: A
   RecordLine: 默认

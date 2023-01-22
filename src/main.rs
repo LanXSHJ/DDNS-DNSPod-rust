@@ -5,14 +5,14 @@ use serde::{Serialize, Deserialize};
 use reqwest;
 use anyhow::Result;
 use clap::Parser;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use tokio::fs;
 use chrono::Utc;
 use sha2::Sha256;
 use hmac::{Hmac, Mac};
 use hex;
 
-/// A simple rust program which change DNS resolution of one domain to current ip of the machine by DNSPod API.
+/// A simple rust program which change DNS resolution record of one domain to current ip of the machine by DNSPod API.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -34,8 +34,6 @@ struct DomainConfig {
     pub domain: String,
     #[serde(rename = "SubDomain")]
     pub sub_domain: String,
-    #[serde(rename = "RecordType")]
-    pub record_type: String,
     #[serde(rename = "RecordLine")]
     pub record_line: String
 }
@@ -71,28 +69,127 @@ async fn get_current_ip() -> Result<String> {
     Ok(ip)
 }
 
-// https://cloud.tencent.com/document/product/1427/56180
 async fn do_ddns(cfg: GlobalConfig, ip: String) -> Result<()> {
+    if let Some((record_id, current_ip)) = get_a_records(&cfg).await? {
+        if current_ip == ip {
+            println!("the record is good now: {ip}\nnot need to modify");
+            return Ok(());
+        }
+        println!("try to modify record whose record_id = {record_id}");
+        modify_record(&cfg, ip, record_id).await?;
+    } else {
+        create_a_record(&cfg, ip).await?;
+    }
+    Ok(())
+}
+
+// https://cloud.tencent.com/document/product/1427/56166
+async fn get_a_records(cfg: &GlobalConfig) -> Result<Option<(i64, String)>> {
+    let post_json = json!({
+        "Domain": &cfg.domain_cfg.domain,
+        "Subdomain": &cfg.domain_cfg.sub_domain, // suck API parameter
+        "RecordType": "A",
+        "RecordLine": &cfg.domain_cfg.record_line,
+    });
+    let post_json_str = serde_json::to_string(&post_json)?;
+    let post_json_sha256 = sha256::digest(post_json_str);
+
+    let hdr = gen_dnspod_post_req_hdr(&cfg, "DescribeRecordList", post_json_sha256)?;
+    
+    let client = reqwest::Client::new();
+    let rep = client.post("https://dnspod.tencentcloudapi.com")
+        .headers(hdr)
+        .json(&post_json)
+        .send()
+        .await?;
+    
+    let rep_json: Map<String, Value> = serde_json::from_str(rep.text().await?.as_str())?;
+    // println!("get_a_records response: {rep_json:?}");
+    if let Some(err) = ext_response_error(&rep_json) {
+        println!("can't find such a record: {err:?}");
+        Ok(None)
+    } else {
+        // just pick the first
+        let record_id = rep_json["Response"]["RecordList"][0]["RecordId"].as_i64().unwrap();
+        let ip = rep_json["Response"]["RecordList"][0]["Value"].as_str().unwrap();
+        Ok(Some((record_id, ip.to_string())))
+    }
+
+}
+
+// https://cloud.tencent.com/document/product/1427/56180
+async fn create_a_record(cfg: &GlobalConfig, ip: String) -> Result<()> {
     let post_json = json!({
             "Domain": &cfg.domain_cfg.domain,
             "SubDomain": &cfg.domain_cfg.sub_domain,
-            "RecordType": &cfg.domain_cfg.record_type,
+            "RecordType": "A",
             "RecordLine": &cfg.domain_cfg.record_line,
             "Value": &ip
         }
     );
-
     let post_json_str = serde_json::to_string(&post_json)?;
-    println!("json to post: {}\n", post_json_str);
     let post_json_sha256 = sha256::digest(post_json_str);
 
+    let hdr = gen_dnspod_post_req_hdr(&cfg, "CreateRecord", post_json_sha256)?;
+
+    let client = reqwest::Client::new();
+    let rep = client.post("https://dnspod.tencentcloudapi.com")
+        .headers(hdr)
+        .json(&post_json)
+        .send()
+        .await?;
+    
+    let rep_json: Map<String, Value> = serde_json::from_str(rep.text().await?.as_str())?;
+    // println!("create_a_record response: {rep_json:?}");
+    if let Some(err) = ext_response_error(&rep_json) {
+        println!("create a record faild: {err:?}");
+    } else {
+        println!("create a record to {ip} successfully.")
+    }
+    
+    Ok(())
+}
+
+// https://cloud.tencent.com/document/product/1427/56158
+async fn modify_record(cfg: &GlobalConfig, ip: String, record_id: i64) -> Result<()> {
+    let post_json = json!({
+        "Domain": &cfg.domain_cfg.domain,
+        "SubDomain": &cfg.domain_cfg.sub_domain,
+        "RecordId": record_id,
+        "RecordLine": &cfg.domain_cfg.record_line,
+        "Value": &ip
+    });
+    let post_json_str = serde_json::to_string(&post_json)?;
+    let post_json_sha256 = sha256::digest(post_json_str);
+
+    let hdr = gen_dnspod_post_req_hdr(&cfg, "ModifyDynamicDNS", post_json_sha256)?;
+
+    let client = reqwest::Client::new();
+    let rep = client.post("https://dnspod.tencentcloudapi.com")
+        .headers(hdr)
+        .json(&post_json)
+        .send()
+        .await?;
+
+    let rep_json: Map<String, Value> = serde_json::from_str(rep.text().await?.as_str())?;
+    // println!("modify_record response: {rep_json:?}");
+    if let Some(err) = ext_response_error(&rep_json) {
+        println!("modify a record faild: {err:?}");
+    } else {
+        println!("modify a record to {ip} successfully.")
+    }
+    
+    Ok(())
+}
+
+fn gen_dnspod_post_req_hdr(cfg: &GlobalConfig, act: &str, post_json_sha256: String) -> Result<HeaderMap> {
     let mut hdr = HeaderMap::new();
     hdr.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     hdr.insert(header::HOST, HeaderValue::from_static("dnspod.tencentcloudapi.com"));
     let now = Utc::now();
     let timestamp = now.timestamp();
     hdr.insert("X-TC-Timestamp", HeaderValue::from_str(&timestamp.to_string())?);
-    hdr.insert("X-TC-Action", HeaderValue::from_static("CreateRecord"));
+    hdr.insert("X-TC-Action", HeaderValue::from_str(act)?);
     hdr.insert("X-TC-Version", HeaderValue::from_static("2021-03-23"));
 
     let canonical_request = format!("{}\n{}\n{}\n{}\n{}\n{}",
@@ -109,7 +206,7 @@ async fn do_ddns(cfg: GlobalConfig, ip: String) -> Result<()> {
         ),
         post_json_sha256.to_lowercase()
     );
-    println!("canonical_request: {canonical_request}\n");
+    // println!("canonical_request: {canonical_request}\n");
 
     let canonical_request_sha256 = sha256::digest(canonical_request).to_lowercase();
     let str_to_sign = format!("{}\n{}\n{}\n{}",
@@ -118,7 +215,7 @@ async fn do_ddns(cfg: GlobalConfig, ip: String) -> Result<()> {
         format!("{}/dnspod/tc3_request", now.date_naive()),
         canonical_request_sha256
     );
-    println!("str_to_sign: {str_to_sign}\n");
+    // println!("str_to_sign: {str_to_sign}\n");
 
     let sec_date = hmacsha256(format!("TC3{}", cfg.dnspod_cfg.secret_key).as_bytes(), now.date_naive().to_string().as_bytes())?;
     let sec_service = hmacsha256(sec_date.as_slice(), b"dnspod")?;
@@ -137,21 +234,11 @@ async fn do_ddns(cfg: GlobalConfig, ip: String) -> Result<()> {
         ),
         sign_hex
     );
-    println!("authorization: {authorization}\n");
+    // println!("authorization: {authorization}\n");
 
     hdr.insert(header::AUTHORIZATION, HeaderValue::from_str(&authorization)?);
-
-
-    let client = reqwest::Client::new();
-    let rep = client.post("https://dnspod.tencentcloudapi.com")
-        .headers(hdr)
-        .json(&post_json)
-        .send()
-        .await?;
     
-    println!("response: {}", rep.text().await?);
-    
-    Ok(())
+    Ok(hdr)
 }
 
 fn hmacsha256(key: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
@@ -160,4 +247,19 @@ fn hmacsha256(key: &[u8], msg: &[u8]) -> Result<Vec<u8>> {
     let result = mac.finalize();
     
     Ok(result.into_bytes().to_vec())
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct DNSPodError {
+    #[serde(rename = "Code")]
+    code: String,
+    #[serde(rename = "Message")]
+    message: String
+}
+
+fn ext_response_error(rep_json: &Map<String, Value>) -> Option<DNSPodError> {
+    if let Ok(err) = serde_json::from_value(rep_json["Response"]["Error"].clone()) {
+        return Some(err);
+    }
+    None
 }
